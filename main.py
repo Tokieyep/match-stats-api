@@ -105,6 +105,12 @@ async def get_match(match_id: int):
 @app.delete("/matches/{match_id}")
 async def delete_match(match_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("DELETE FROM matches WHERE id = ?", (match_id,))
+        await db.commit()
+
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Match not found")
+    return {"deleted": True, "match_id": match_id}
 
 @app.get("/stats")
 async def stats():
