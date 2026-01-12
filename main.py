@@ -5,6 +5,14 @@ from datetime import datetime
 from typing import Literal
 from pydantic import Field
 from fastapi import HTTPException
+import aiosqlite
+from contextlib import asynccontextmanager
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi import Request
+
+
+templates = Jinja2Templates(directory="templates")
 
 class MatchCreate(BaseModel):
     game: str
@@ -14,10 +22,28 @@ class MatchCreate(BaseModel):
     deaths: int = Field(ge=0, le=100)
     notes: Optional[str] = None
 
-app = FastAPI()
+DB_PATH = "match_stats.db"
 
-MATCHES: list[dict] = []
-NEXT_ID = 1
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game TEXT NOT NULL,
+                map TEXT NOT NULL,
+                result TEXT NOT NULL,
+                kills INTEGER NOT NULL,
+                deaths INTEGER NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """)
+        await db.commit()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def read_root():
@@ -30,43 +56,128 @@ async def root():
 
 @app.post("/matches")
 async def create_match(payload: MatchCreate):
-    global NEXT_ID
+    created_at = datetime.utcnow().isoformat()
 
-    match = {
-        "id": NEXT_ID,
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            INSERT INTO matches (game, map, result, kills, deaths, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, 
+            (payload.game, payload.map, payload.result, payload.kills, payload.deaths, payload.notes, created_at)
+        )
+        await db.commit()
+        match_id = cursor.lastrowid
+
+    return {
+        "id": match_id,
         "game": payload.game,
         "map": payload.map,
         "result": payload.result,
         "kills": payload.kills,
         "deaths": payload.deaths,
         "notes": payload.notes,
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": created_at
     }
-
-    MATCHES.append(match)
-    NEXT_ID += 1
-    return match
 
 @app.get("/matches")
 async def get_matches():
-    return list(reversed(MATCHES))
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM matches ORDER BY id DESC")
+        rows = await cursor.fetchall()
+
+    return [dict(r) for r in rows]
 
 
 @app.get("/matches/{match_id}")
 async def get_match(match_id: int):
-    for m in MATCHES:
-        if m["id"] == match_id:
-            return m
-        
-    raise HTTPException(status_code=404, detail="Match not found")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM matches WHERE id = ?", (match_id,))
+        row = await cursor.fetchone()
 
+    if row is None:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    return dict(row)
+
+
+@app.delete("/matches/{match_id}")
+async def delete_match(match_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
 
 @app.get("/stats")
 async def stats():
-    total = len(MATCHES)
-    wins = sum(1 for m in MATCHES if m["result"] == "win")
+    async with aiosqlite.connect(DB_PATH) as db:
+        # total m
+        cursor = await db.execute("SELECT COUNT(*) FROM matches")
+        (total,) = await cursor.fetchone()
+
+        # total w
+        cursor = await db.execute("SELECT COUNT(*) FROM matches WHERE result = 'win'")
+        (wins,) = await cursor.fetchone()
+
+        # sums for kd
+        cursor = await db.execute("SELECT COALESCE(SUM(kills), 0), COALESCE(SUM(deaths), 0) FROM matches")
+        kills, deaths = await cursor.fetchone()
+
+    losses = total - wins
+    winrate = round((wins / total) * 100, 1) if total > 0 else 0.0
+    kd = round((kills / deaths), 2) if deaths > 0 else None
+
+
+
     return {
         "total_matches": total,
         "wins": wins,
-        "losses": total - wins
+        "losses": total - wins,
+        "winrate": winrate,
+        "total_kills": kills,
+        "total_deaths": deaths,
+        "over_all_kd": kd
     }
+
+
+
+@app.get("/hud", response_class=HTMLResponse)
+async def hub(request: Request):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM matches")
+        (total,) = await cursor.fetchone()
+
+        cursor = await db.execute("SELECT COUNT(*) FROM matches WHERE result = 'win'")
+        (wins,) = await cursor.fetchone()
+
+        cursor = await db.execute("SELECT COALESCE(SUM(kills), 0), COALESCE(SUM(deaths), 0) FROM matches")
+        kills, deaths = await cursor.fetchone()
+
+        cursor = await db.execute("""
+            SELECT id, game, map, result, kills, deaths, notes, created_at
+            FROM matches
+            ORDER BY id DESC
+            LIMIT 10
+        """)
+        recent = await cursor.fetchall()
+
+    losses = total - wins
+    winrate = round((wins / total) * 100, 1) if total > 0 else 0.0
+    kd = round((kills / deaths), 2) if deaths > 0 else None
+    kd_display = kd if kd is not None else "-"
+   
+
+    return templates.TemplateResponse(
+        "hud.html",
+        {
+            "request": request,
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "winrate": winrate,
+            "kills": kills,
+            "deaths": deaths,
+            "kd_display": kd_display,
+            "recent": recent,
+        },
+    )
