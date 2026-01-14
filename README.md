@@ -11,8 +11,6 @@ simple REST API for tracking match results and basic stats.
 
 What it is: Match Stats API (FastAPI + SQLite + HUD)
 
-How it was built: guided + AI-assisted learning project
-
 What I learned: CRUD, validation, DB queries, templating, deployment
 
 Pushed with Render: 
